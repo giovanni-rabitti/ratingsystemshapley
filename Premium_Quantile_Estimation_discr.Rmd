@@ -1,0 +1,2718 @@
+---
+title: "Premium Quantile Principle Estimation via Quantile Regression and Parametric Quantile Regression with veh_value discretization"
+author: "Arianna Vallarino"
+date: "3/2/2022"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(insuranceData)
+library(Hmisc)
+library(lattice)
+library(survival)
+#library(Formula)
+#library(ggplot2)
+library(boot)
+library(qrcm)
+library(quantreg)
+library(xtable)
+library(dplyr)
+#library(tibble)
+#library(GGally)
+```
+
+## Final Version
+
+We load the dataset and transform the variables veh_age and agecat into factor variables.
+```{r}
+data(dataCar)
+dataCar$veh_age <- factor(dataCar$veh_age, order = F, 
+                          levels = c("1", "2", "3", "4"))
+dataCar$agecat <- factor(dataCar$agecat, order = F, 
+                          levels = c("1", "2", "3", "4", "5", "6"))
+```
+
+```{r}
+a <- round(mean(subset(dataCar, veh_value <= 2.5)$veh_value), 3)
+b <- round(mean(subset(dataCar, veh_value > 2.5 & veh_value <= 5.0)$veh_value), 3)
+c <- round(mean(subset(dataCar, veh_value > 5.0 & veh_value <= 7.5)$veh_value), 3)
+d <- round(mean(subset(dataCar, veh_value > 7.5 & veh_value <= 10.0)$veh_value), 3)
+e <- round(mean(subset(dataCar, veh_value > 10.0 & veh_value <= 12.5)$veh_value), 3)
+f <- round(mean(subset(dataCar, veh_value > 12.5)$veh_value), 3)
+
+```
+
+```{r}
+veh_value_discr <- cut(dataCar$veh_value, c(-1,2.5,5.0,7.5,10.0,12.5,100), labels = c(a, b, c, d, e, f))
+```
+
+```{r}
+veh_value_discr <- as.character(veh_value_discr)
+veh_value_discr <- as.numeric(veh_value_discr)
+```
+
+```{r}
+table(veh_value_discr)
+```
+
+```{r}
+dataCar <- cbind(dataCar, veh_value_discr)
+```
+
+```{r}
+str(dataCar)
+```
+
+# BAIONE E BIANCALANA 2021 METHOD (SCANDINAVIAN ACTUARIAL JOURNAL)
+
+The final goal is to estimate the Premium Quantile Principle for each policyholder using the TSPQR model with the following formula: 
+\begin{equation}
+\label{QPP}
+P_{i} = \alpha \cdot Q_{\bar{\theta}}[S_{i}] + (1-\alpha) \cdot E[S_{i}]
+\end{equation}
+
+# STEP 1: Logistic regression adjusted for exposure.
+
+```{r}
+source("logit-exposure-adjusted.r")
+```
+
+```{r}
+logit <- glm(clm ~ veh_age + veh_value_discr + veh_body + agecat + area + gender, family = binomial(link = logitexp(dataCar$exposure)), data = dataCar)
+
+summary(logit)
+
+#print(xtable(summary(logit), digits = c(0, 3, 3, 2, -2), comment = FALSE))
+```
+
+Estimation of the probability of "no claims" $p_{i}$ for each policyholder:
+```{r}
+prob <- inv.logit(predict(logit, newdata = dataCar))
+prob_no_claims <- 1 - prob
+```
+
+# SECOND STEP: claim's severity estimate
+
+## Equivalence Premium estimation
+
+We use a GLM Gamma regression to estimate $E[\widetilde{S}_{i}]$
+```{r, echo = T, eval = T, results = "asis"}
+gamma_glm = glm(claimcst0 ~ veh_age + veh_value_discr + veh_body + agecat + area + gender, family = Gamma(link = "log"),
+                data = subset(dataCar, clm == 1))
+
+summary(gamma_glm)
+
+#print(xtable(summary(gamma_glm), digits = c(0, 3, 3, 2, -2), comment = F))
+```
+
+```{r}
+cond_mean <- predict(gamma_glm, newdata = dataCar, type = "response")
+```
+
+and then we estimate the pure premium (or equivalence premium) $E[S_{i}] = (1-p_{i}) \cdot E[\widetilde{S}_{i}]$
+
+```{r}
+equivalence_premium = (1 - prob_no_claims) * cond_mean
+```
+
+## Quantile premium estimation using Parametric Quantile Regression
+
+We estimate $Q_{\theta^{*}_{i}}[\widetilde{S_{i}}]$ for each policyholder using the parametric quantile regression.
+```{r}
+pqr <- iqr(log(claimcst0) ~ veh_age + veh_value_discr + veh_body + agecat + area + gender, formula.p = ~slp(p, k = 1, intercept = FALSE), data = subset(dataCar, clm == 1))
+
+summary(pqr)
+```
+
+```{r}
+#print(xtable(coef(pqr), digits = 3), comment = F)
+```
+
+To estimate the conditional quantile for each policy, We need the probability level $\theta^{*}_{i}$ for each policyholder, which We derive with the following formula:
+\begin{equation}
+\label{theta_star}
+\theta^{*}_{i} = \frac{\bar{\theta} - p_{i}}{1-p_{i}}
+\end{equation}
+
+```{r}
+theta_bar <- 0.95
+theta_star <- (theta_bar - prob_no_claims) / prob
+```
+
+Now We can find the pqr quantiles for each policy.
+
+```{r}
+quantile_pqr <- array()
+n <- nrow(dataCar)
+for (i in 1:n) {
+  quantile_pqr[i] <-exp( predict(pqr, type = "QF", newdata = dataCar[i,], p = theta_star[i], se = FALSE))
+}
+```
+
+quantile_pqr is a list, We need to transform it into a vector.
+
+```{r}
+quantile_PQR <- unlist(quantile_pqr)
+```
+
+### Calibration of alpha pqr
+
+We need to find firstly the expected loss $E[L]$ and the aggregate premium $\pi[L]$ 
+```{r}
+expected_loss <- sum(equivalence_premium*dataCar$exposure)
+sigma = 0.1
+aggregate_premium <- expected_loss * (1 + sigma * 3)
+```
+
+Then We find the quantile loss of the parametric quantile regression model
+```{r}
+quantile_loss_pqr <- sum(quantile_PQR * dataCar$exposure)
+quantile_loss_pqr
+```
+And finally we calibrate alpha $\alpha = \frac{\pi[L] - E[L]}{Q_{\bar{\theta}}[L] - E[L]}$
+```{r}
+alpha_pqr <- (aggregate_premium - expected_loss)/(quantile_loss_pqr - expected_loss)
+alpha_pqr
+```
+We can now estimate the Quantile Premium Principle using the formula (\ref{QPP}). \
+(QPP using Parametric Quantile Regression)
+
+```{r}
+QPP_PQR_discr <- alpha_pqr * quantile_PQR + (1 - alpha_pqr) * equivalence_premium
+```
+
+We visualize the results obtained
+```{r}
+boxplot(QPP_PQR_discr)
+```
+
+```{r}
+range(QPP_PQR_discr)
+```
+We add the row to the dataset
+```{r}
+dataCar <- cbind(dataCar, QPP_PQR_discr)
+```
+
+# BAIONE E BIANCALANA 2019 METHOD (NORTH AMERICA)
+
+Using the already estimated aggregate premium (EIOPA 2009) and the premium quantile principle proposed by Baione and Biancalana (2019) $\pi(Y) = \sum (1-p_{i}) \cdot Q_{\widetilde{\theta}}[\widetilde{S}_{i}]$ We find the probability level $\widetilde{S}_{i}$ that "spreads" the losses over the quantiles.
+
+```{r}
+f <- function(theta){
+  qr <- rq(log(claimcst0) ~ veh_age + veh_value_discr + veh_body + agecat + area + gender, tau = theta, data = subset(dataCar, clm == 1))
+  qr_estimate <- exp(predict(qr, newdata = dataCar))
+  qr_sum <- sum(prob * qr_estimate * dataCar$exposure)
+
+return(abs(qr_sum - aggregate_premium)) 
+  
+}
+```
+
+```{r}
+optimization <- optim(0, f, method = "Brent", lower = 0, upper = 1 )
+```
+
+```{r}
+theta_qr <- optimization$par
+theta_qr
+```
+
+```{r}
+qr <- rq(formula = log(claimcst0) ~ veh_age  + veh_value_discr + veh_body + agecat + area + gender, tau = theta_qr,
+data = subset(dataCar, clm == 1))
+```
+
+```{r}
+summary(qr,  se = "iid") 
+```
+We estimate the conditional quantile $Q_{\widetilde{\theta}}(\widetilde{S}_{i})$
+```{r}
+qr_estimate <- exp(predict(qr, newdata = dataCar))
+```
+
+Using this methodology, the premium principle is computed with the followig formula: $P^{(i)}_{QR} = (1-p_{i}) \cdot Q_{\widetilde{\theta}}\biggl(\widetilde{S}^{(i)}\biggr)$
+
+```{r}
+Premium_QR_discr = prob * qr_estimate
+```
+
+We visualize the results obtained
+```{r}
+boxplot(Premium_QR_discr)
+```
+
+```{r}
+range(Premium_QR_discr)
+```
+
+We add the row to the dataset
+```{r}
+dataCar <- cbind(dataCar, Premium_QR_discr)
+```
+
+# VEH AGE + GENDER 
+
+We estimate the premium for each class of the rating system composed by these two covariates. We work on the aggregate dataset.
+```{r}
+df1 <- aggregate(cbind(exposure, numclaims, claimcst0) ~ veh_age + gender, data = dataCar, FUN = sum)
+```
+
+We estimate the Logit GLM.
+```{r}
+logit1 <- glm(clm ~ veh_age + gender, family = binomial(link = logitexp(dataCar$exposure)), data = dataCar)
+
+summary(logit1)
+```
+
+And the probability of having no claims for each risk class.
+```{r}
+prob1 = inv.logit(predict(logit1, newdata = dataCar))
+prob_no_claims1 = 1 - prob1
+
+round(unique(prob_no_claims1),3)
+```
+
+Then We estimate the conditional expectation of the loss with the Gamma GLM regression.
+```{r}
+gamma_glm1 = glm(claimcst0 ~ veh_age + gender, family = Gamma(link = "log"), data = subset(dataCar, clm == 1))
+
+summary(gamma_glm1)
+```
+
+```{r}
+cond_mean1 <- predict(gamma_glm1, newdata = dataCar, type = "response")
+
+round(unique(cond_mean1),2)
+```
+
+Finally we estimate the pure premium.
+```{r}
+equivalence_premium1 <- (1 - prob_no_claims1) * cond_mean1
+
+round(unique(equivalence_premium1),2)
+```
+
+We estimate the conditional quantile using the parametric quantile regression.
+```{r}
+pqr1 = iqr(log(claimcst0) ~ veh_age + gender, formula.p = ~ slp(p, k = 3, intercept = FALSE), data = subset(dataCar, clm == 1))
+
+summary(pqr1)
+```
+
+We estimate the probability level
+```{r}
+theta_star1 <- (theta_bar - prob_no_claims1) / prob1
+
+round(unique(theta_star1),3)
+```
+
+```{r}
+quantile_pqr1 <- array()
+n <- nrow(dataCar)
+for (i in 1:n) {
+  quantile_pqr1[i] <-exp( predict(pqr1, type = "QF", newdata = dataCar[i,], p = theta_star1[i], se = FALSE))
+}
+```
+
+We estimate the quantile
+```{r}
+quantile_PQR1 <- unlist(quantile_pqr1)
+
+round(unique(quantile_PQR1),2)
+```
+
+Now We calibrate alpha
+```{r}
+expected_loss1 <- sum(equivalence_premium1*dataCar$exposure)
+expected_loss1
+aggregate_premium1 <- expected_loss1 * (1 + sigma*3)
+aggregate_premium1
+```
+
+```{r}
+quantile_loss_pqr1 <- sum(quantile_PQR1 * dataCar$exposure)
+quantile_loss_pqr1
+```
+
+```{r}
+alpha_pqr1 <- (aggregate_premium1 - expected_loss1) / (quantile_loss_pqr1 - expected_loss1)
+alpha_pqr1
+```
+
+```{r}
+PQR_AGE_GEN <- alpha_pqr1 * quantile_PQR1 + (1 - alpha_pqr1) * equivalence_premium1
+round(unique(PQR_AGE_GEN),2)
+```
+
+```{r}
+dataCar <- cbind(dataCar, PQR_AGE_GEN)
+```
+
+Now We compute the insurance premium using the QR.
+```{r}
+f <- function(theta){
+  qr <- rq(log(claimcst0) ~ veh_age + gender, tau = theta, data = subset(dataCar, clm == 1))
+  qr_estimate <- exp(predict(qr, newdata = dataCar))
+  qr_sum <- sum(prob1 * qr_estimate * dataCar$exposure)
+
+return(abs(qr_sum - aggregate_premium1)) 
+  
+}
+```
+
+```{r}
+optimization <- optim(0, f, method = "Brent", lower = 0, upper = 1 )
+```
+
+```{r}
+theta_qr1 <- optimization$par
+theta_qr1
+```
+
+```{r}
+qr1 <- rq(formula = log(claimcst0) ~ veh_age  + gender, tau = theta_qr1, data = subset(dataCar, clm == 1))
+```
+
+```{r}
+summary(qr1,  se = "iid") 
+```
+We estimate the conditional quantile
+```{r}
+qr_estimate1 <- exp(predict(qr1, newdata = dataCar))
+```
+
+and the Premium Quantile Principle 
+```{r}
+QR_AGE_GEN = prob1 * qr_estimate1
+round(unique(QR_AGE_GEN),2)
+```
+
+We add the line to the dataset
+```{r}
+dataCar <- cbind(dataCar, QR_AGE_GEN) 
+```
+
+We repeat the same procedure for all possible rating systems composed by two risk factors.
+
+# VEH BODY + VEH AGE 
+
+```{r}
+df2 <- aggregate(cbind(exposure, numclaims, claimcst0) ~ veh_age + veh_body, data = dataCar, FUN = sum)
+```
+
+```{r}
+logit2 <- glm(clm ~ veh_age + veh_body, family = binomial(link = logitexp(dataCar$exposure)), data = dataCar)
+
+summary(logit2)
+```
+
+```{r}
+prob2 = inv.logit(predict(logit2, newdata = dataCar))
+prob_no_claims2 = 1 - prob2
+
+round(unique(prob_no_claims2),3)
+```
+
+
+```{r}
+gamma_glm2 = glm(claimcst0 ~ veh_age + veh_body, family = Gamma(link = "log"), data = subset(dataCar, clm == 1))
+
+summary(gamma_glm2)
+```
+
+```{r}
+cond_mean2 <- predict(gamma_glm2, newdata = dataCar, type = "response")
+
+round(unique(cond_mean2),2)
+```
+
+```{r}
+equivalence_premium2 <- (1 - prob_no_claims2) * cond_mean2
+
+round(unique(equivalence_premium2),2)
+```
+
+```{r}
+pqr2 = iqr(log(claimcst0) ~ veh_age + veh_body, formula.p = ~ slp(p, k = 1, intercept = FALSE), data = subset(dataCar, clm == 1))
+
+summary(pqr2)
+```
+
+```{r}
+theta_star2 <- (theta_bar - prob_no_claims2) / prob2
+
+round(unique(theta_star2),3)
+```
+
+```{r}
+quantile_pqr2 <- array()
+n <- nrow(dataCar)
+for (i in 1:n) {
+  quantile_pqr2[i] <-exp( predict(pqr2, type = "QF", newdata = dataCar[i,], p = theta_star2[i], se = FALSE))
+}
+```
+
+
+```{r}
+quantile_PQR2 <- unlist(quantile_pqr2)
+
+round(unique(quantile_PQR2),2)
+```
+
+```{r}
+expected_loss2 <- sum(equivalence_premium2*dataCar$exposure)
+expected_loss2
+aggregate_premium2 <- expected_loss2 * (1 + sigma*3)
+aggregate_premium2
+```
+
+```{r}
+quantile_loss_pqr2 <- sum(quantile_PQR2 * dataCar$exposure)
+quantile_loss_pqr2
+```
+
+```{r}
+alpha_pqr2 <- (aggregate_premium2 - expected_loss2) / (quantile_loss_pqr2 - expected_loss2)
+alpha_pqr2
+```
+
+```{r}
+PQR_BODY_AGE <- alpha_pqr2 * quantile_PQR2 + (1 - alpha_pqr2) * equivalence_premium2
+round(unique(PQR_BODY_AGE),2)
+```
+
+```{r}
+dataCar <- cbind(dataCar, PQR_BODY_AGE)
+```
+
+
+```{r}
+f <- function(theta){
+  qr <- rq(log(claimcst0) ~ veh_age + veh_body, tau = theta, data = subset(dataCar, clm == 1))
+  qr_estimate <- exp(predict(qr, newdata = dataCar))
+  qr_sum <- sum(prob2 * qr_estimate * dataCar$exposure)
+
+return(abs(qr_sum - aggregate_premium2)) 
+  
+}
+```
+
+```{r}
+optimization <- optim(0, f, method = "Brent", lower = 0, upper = 1 )
+```
+
+```{r}
+theta_qr2 <- optimization$par
+theta_qr2
+```
+
+```{r}
+qr2 <- rq(formula = log(claimcst0) ~ veh_age  + veh_body, tau = theta_qr2, data = subset(dataCar, clm == 1))
+```
+
+```{r}
+summary(qr2,  se = "iid") 
+```
+
+```{r}
+qr_estimate2 <- exp(predict(qr2, newdata = dataCar))
+```
+
+ 
+```{r}
+QR_BODY_AGE = prob2 * qr_estimate2
+round(unique(QR_BODY_AGE),2)
+```
+
+
+```{r}
+dataCar <- cbind(dataCar, QR_BODY_AGE) 
+```
+
+# VEH BODY + AGECAT 
+
+```{r}
+df3 <- aggregate(cbind(exposure, numclaims, claimcst0) ~ veh_body + agecat, data = dataCar, FUN = sum)
+```
+
+
+```{r}
+logit3 <- glm(clm ~ agecat + veh_body, family = binomial(link = logitexp(dataCar$exposure)), data = dataCar)
+
+summary(logit3)
+```
+
+```{r}
+prob3 = inv.logit(predict(logit3, newdata = dataCar))
+prob_no_claims3 = 1 - prob3
+
+round(unique(prob_no_claims3),3)
+```
+
+
+```{r}
+gamma_glm3 = glm(claimcst0 ~ agecat + veh_body, family = Gamma(link = "log"), data = subset(dataCar, clm == 1))
+
+summary(gamma_glm3)
+```
+
+```{r}
+cond_mean3 <- predict(gamma_glm3, newdata = dataCar, type = "response")
+
+round(unique(cond_mean3),2)
+```
+
+
+```{r}
+equivalence_premium3 <- (1 - prob_no_claims3) * cond_mean3
+
+round(unique(equivalence_premium3),2)
+```
+
+
+```{r}
+pqr3 = iqr(log(claimcst0) ~ agecat + veh_body, formula.p = ~ slp(p, k = 1, intercept = FALSE), data = subset(dataCar, clm == 1))
+
+summary(pqr3)
+```
+
+
+```{r}
+theta_star3 <- (theta_bar - prob_no_claims3) / prob3
+
+round(unique(theta_star3),3)
+```
+
+```{r}
+quantile_pqr3 <- array()
+n <- nrow(dataCar)
+for (i in 1:n) {
+  quantile_pqr3[i] <-exp( predict(pqr3, type = "QF", newdata = dataCar[i,], p = theta_star3[i], se = FALSE))
+}
+```
+
+
+```{r}
+quantile_PQR3 <- unlist(quantile_pqr3)
+
+round(unique(quantile_PQR3),2)
+```
+
+
+```{r}
+expected_loss3 <- sum(equivalence_premium3*dataCar$exposure)
+expected_loss3
+aggregate_premium3 <- expected_loss3 * (1 + sigma*3)
+aggregate_premium3
+```
+
+```{r}
+quantile_loss_pqr3 <- sum(quantile_PQR3 * dataCar$exposure)
+quantile_loss_pqr3
+```
+
+```{r}
+alpha_pqr3 <- (aggregate_premium3 - expected_loss3) / (quantile_loss_pqr3 - expected_loss3)
+alpha_pqr3
+```
+
+```{r}
+PQR_BODY_AGECAT <- alpha_pqr3 * quantile_PQR3 + (1 - alpha_pqr3) * equivalence_premium3
+round(unique(PQR_BODY_AGECAT),2)
+```
+
+```{r}
+dataCar <- cbind(dataCar, PQR_BODY_AGECAT)
+```
+
+
+```{r}
+f <- function(theta){
+  qr <- rq(log(claimcst0) ~ veh_body + agecat, tau = theta, data = subset(dataCar, clm == 1))
+  qr_estimate <- exp(predict(qr, newdata = dataCar))
+  qr_sum <- sum(prob3 * qr_estimate * dataCar$exposure)
+
+return(abs(qr_sum - aggregate_premium3)) 
+  
+}
+```
+
+```{r}
+optimization <- optim(0, f, method = "Brent", lower = 0, upper = 1 )
+```
+
+```{r}
+theta_qr3 <- optimization$par
+theta_qr3
+```
+
+```{r}
+qr3 <- rq(formula = log(claimcst0) ~ veh_body  + agecat, tau = theta_qr3, data = subset(dataCar, clm == 1))
+```
+
+```{r}
+summary(qr3,  se = "iid") 
+```
+
+```{r}
+qr_estimate3 <- exp(predict(qr3, newdata = dataCar))
+```
+
+
+```{r}
+QR_BODY_AGECAT = prob3 * qr_estimate3
+round(unique(QR_BODY_AGECAT),2)
+```
+
+
+```{r}
+dataCar <- cbind(dataCar, QR_BODY_AGECAT) 
+```
+
+# VEH BODY + GENDER 
+.
+```{r}
+df4 <- aggregate(cbind(exposure, numclaims, claimcst0) ~ veh_body + gender, data = dataCar, FUN = sum)
+```
+
+
+```{r}
+logit4 <- glm(clm ~ gender + veh_body, family = binomial(link = logitexp(dataCar$exposure)), data = dataCar)
+
+summary(logit4)
+```
+
+
+```{r}
+prob4 = inv.logit(predict(logit4, newdata = dataCar))
+prob_no_claims4 = 1 - prob4
+
+round(unique(prob_no_claims4),3)
+```
+
+
+```{r}
+gamma_glm4 = glm(claimcst0 ~ gender + veh_body, family = Gamma(link = "log"), data = subset(dataCar, clm == 1))
+
+summary(gamma_glm4)
+```
+
+```{r}
+cond_mean4 <- predict(gamma_glm4, newdata = dataCar, type = "response")
+
+round(unique(cond_mean4),2)
+```
+
+
+```{r}
+equivalence_premium4 <- (1 - prob_no_claims4) * cond_mean4
+
+round(unique(equivalence_premium4),2)
+```
+
+
+```{r}
+pqr4 = iqr(log(claimcst0) ~ gender + veh_body, formula.p = ~ slp(p, k = 2, intercept = FALSE), data = subset(dataCar, clm == 1))
+
+summary(pqr4)
+```
+
+
+```{r}
+theta_star4 <- (theta_bar - prob_no_claims4) / prob4
+
+round(unique(theta_star4),3)
+```
+
+```{r}
+quantile_pqr4 <- array()
+n <- nrow(dataCar)
+for (i in 1:n) {
+  quantile_pqr4[i] <-exp( predict(pqr4, type = "QF", newdata = dataCar[i,], p = theta_star4[i], se = FALSE))
+}
+```
+
+
+```{r}
+quantile_PQR4 <- unlist(quantile_pqr4)
+
+round(unique(quantile_PQR4),2)
+```
+
+
+```{r}
+expected_loss4 <- sum(equivalence_premium4*dataCar$exposure)
+expected_loss4
+aggregate_premium4 <- expected_loss4 * (1 + sigma*3)
+aggregate_premium4
+```
+
+```{r}
+quantile_loss_pqr4 <- sum(quantile_PQR4 * dataCar$exposure)
+quantile_loss_pqr4
+```
+
+```{r}
+alpha_pqr4 <- (aggregate_premium4 - expected_loss4) / (quantile_loss_pqr4 - expected_loss4)
+alpha_pqr4
+```
+
+```{r}
+PQR_BODY_GEN <- alpha_pqr4 * quantile_PQR4 + (1 - alpha_pqr4) * equivalence_premium4
+round(unique(PQR_BODY_GEN),2)
+```
+
+```{r}
+dataCar <- cbind(dataCar, PQR_BODY_GEN)
+```
+
+
+```{r}
+f <- function(theta){
+  qr <- rq(log(claimcst0) ~ veh_body + gender, tau = theta, data = subset(dataCar, clm == 1))
+  qr_estimate <- exp(predict(qr, newdata = dataCar))
+  qr_sum <- sum(prob4 * qr_estimate * dataCar$exposure)
+
+return(abs(qr_sum - aggregate_premium4)) 
+  
+}
+```
+
+```{r}
+optimization <- optim(0, f, method = "Brent", lower = 0, upper = 1 )
+```
+
+```{r}
+theta_qr4 <- optimization$par
+theta_qr4
+```
+
+```{r}
+qr4 <- rq(formula = log(claimcst0) ~ veh_body  + gender, tau = theta_qr4, data = subset(dataCar, clm == 1))
+```
+
+```{r}
+summary(qr4,  se = "iid") 
+```
+
+```{r}
+qr_estimate4 <- exp(predict(qr4, newdata = dataCar))
+```
+
+
+```{r}
+QR_BODY_GEN = prob4 * qr_estimate4
+round(unique(QR_BODY_GEN),2)
+```
+
+
+```{r}
+dataCar <- cbind(dataCar, QR_BODY_GEN) 
+```
+
+# VEH AGE + AREA 
+
+```{r}
+df5 <- aggregate(cbind(exposure, numclaims, claimcst0) ~ veh_age + area, data = dataCar, FUN = sum)
+```
+
+
+```{r}
+logit5 <- glm(clm ~ area + veh_age, family = binomial(link = logitexp(dataCar$exposure)), data = dataCar)
+
+summary(logit5)
+```
+
+
+```{r}
+prob5 = inv.logit(predict(logit5, newdata = dataCar))
+prob_no_claims5 = 1 - prob5
+
+round(unique(prob_no_claims5),3)
+```
+
+
+```{r}
+gamma_glm5 = glm(claimcst0 ~ area + veh_age, family = Gamma(link = "log"), data = subset(dataCar, clm == 1))
+
+summary(gamma_glm5)
+```
+
+```{r}
+cond_mean5 <- predict(gamma_glm5, newdata = dataCar, type = "response")
+
+round(unique(cond_mean5),2)
+```
+
+
+```{r}
+equivalence_premium5 <- (1 - prob_no_claims5) * cond_mean5
+
+round(unique(equivalence_premium5),2)
+```
+
+
+```{r}
+pqr5 = iqr(log(claimcst0) ~ area + veh_age, formula.p = ~ slp(p, k = 1, intercept = FALSE), data = subset(dataCar, clm == 1))
+
+summary(pqr5)
+```
+
+
+```{r}
+theta_star5 <- (theta_bar - prob_no_claims5) / prob5
+
+round(unique(theta_star5),3)
+```
+
+```{r}
+quantile_pqr5 <- array()
+n <- nrow(dataCar)
+for (i in 1:n) {
+  quantile_pqr5[i] <-exp( predict(pqr5, type = "QF", newdata = dataCar[i,], p = theta_star5[i], se = FALSE))
+}
+```
+
+
+```{r}
+quantile_PQR5 <- unlist(quantile_pqr5)
+
+round(unique(quantile_PQR5),2)
+```
+
+
+```{r}
+expected_loss5 <- sum(equivalence_premium5*dataCar$exposure)
+expected_loss5
+aggregate_premium5 <- expected_loss5 * (1 + sigma*3)
+aggregate_premium5
+```
+
+```{r}
+quantile_loss_pqr5 <- sum(quantile_PQR5 * dataCar$exposure)
+quantile_loss_pqr5
+```
+
+```{r}
+alpha_pqr5 <- (aggregate_premium5 - expected_loss5) / (quantile_loss_pqr5 - expected_loss5)
+alpha_pqr5
+```
+
+```{r}
+PQR_AGE_AREA <- alpha_pqr5 * quantile_PQR5 + (1 - alpha_pqr5) * equivalence_premium5
+round(unique(PQR_AGE_AREA),2)
+```
+
+```{r}
+dataCar <- cbind(dataCar, PQR_AGE_AREA)
+```
+
+
+```{r}
+f <- function(theta){
+  qr <- rq(log(claimcst0) ~ veh_age + area, tau = theta, data = subset(dataCar, clm == 1))
+  qr_estimate <- exp(predict(qr, newdata = dataCar))
+  qr_sum <- sum(prob5 * qr_estimate * dataCar$exposure)
+
+return(abs(qr_sum - aggregate_premium5)) 
+  
+}
+```
+
+```{r}
+optimization <- optim(0, f, method = "Brent", lower = 0, upper = 1 )
+```
+
+```{r}
+theta_qr5 <- optimization$par
+theta_qr5
+```
+
+```{r}
+qr5 <- rq(formula = log(claimcst0) ~ veh_age  + area, tau = theta_qr5, data = subset(dataCar, clm == 1))
+```
+
+```{r}
+summary(qr5,  se = "iid") 
+```
+
+
+```{r}
+qr_estimate5 <- exp(predict(qr5, newdata = dataCar))
+```
+
+
+```{r}
+QR_AGE_AREA = prob5 * qr_estimate5
+round(unique(QR_AGE_AREA),2)
+```
+
+
+```{r}
+dataCar <- cbind(dataCar, QR_AGE_AREA) 
+```
+
+# GENDER + AGECAT 
+
+```{r}
+df6 <- aggregate(cbind(exposure, numclaims, claimcst0) ~ gender + agecat, data = dataCar, FUN = sum)
+```
+
+
+```{r}
+logit6 <- glm(clm ~ gender + agecat, family = binomial(link = logitexp(dataCar$exposure)), data = dataCar)
+
+summary(logit6)
+```
+
+
+```{r}
+prob6 = inv.logit(predict(logit6, newdata = dataCar))
+prob_no_claims6 = 1 - prob6
+
+round(unique(prob_no_claims6),3)
+```
+
+
+```{r}
+gamma_glm6 = glm(claimcst0 ~ gender + agecat, family = Gamma(link = "log"), data = subset(dataCar, clm == 1))
+
+summary(gamma_glm6)
+```
+
+```{r}
+cond_mean6 <- predict(gamma_glm6, newdata = dataCar, type = "response")
+
+round(unique(cond_mean6),2)
+```
+
+
+```{r}
+equivalence_premium6 <- (1 - prob_no_claims6) * cond_mean6
+
+round(unique(equivalence_premium6),2)
+```
+
+
+```{r}
+pqr6 = iqr(log(claimcst0) ~ gender + agecat, formula.p = ~ slp(p, k = 3, intercept = FALSE), data = subset(dataCar, clm == 1))
+
+summary(pqr6)
+```
+
+
+```{r}
+theta_star6 <- (theta_bar - prob_no_claims6) / prob6
+
+round(unique(theta_star6),3)
+```
+
+```{r}
+quantile_pqr6 <- array()
+n <- nrow(dataCar)
+for (i in 1:n) {
+  quantile_pqr6[i] <-exp( predict(pqr6, type = "QF", newdata = dataCar[i,], p = theta_star6[i], se = FALSE))
+}
+```
+
+
+```{r}
+quantile_PQR6 <- unlist(quantile_pqr6)
+
+round(unique(quantile_PQR6),2)
+```
+
+
+```{r}
+expected_loss6 <- sum(equivalence_premium6*dataCar$exposure)
+expected_loss6
+aggregate_premium6 <- expected_loss6 * (1 + sigma*3)
+aggregate_premium6
+```
+
+```{r}
+quantile_loss_pqr6 <- sum(quantile_PQR6 * dataCar$exposure)
+quantile_loss_pqr6
+```
+
+```{r}
+alpha_pqr6 <- (aggregate_premium6 - expected_loss6) / (quantile_loss_pqr6 - expected_loss6)
+alpha_pqr6
+```
+
+```{r}
+PQR_GEN_AGECAT <- alpha_pqr6 * quantile_PQR6 + (1 - alpha_pqr6) * equivalence_premium6
+round(unique(PQR_GEN_AGECAT),2)
+```
+
+```{r}
+dataCar <- cbind(dataCar, PQR_GEN_AGECAT)
+```
+
+
+```{r}
+f <- function(theta){
+  qr <- rq(log(claimcst0) ~ agecat + gender, tau = theta, data = subset(dataCar, clm == 1))
+  qr_estimate <- exp(predict(qr, newdata = dataCar))
+  qr_sum <- sum(prob6 * qr_estimate * dataCar$exposure)
+
+return(abs(qr_sum - aggregate_premium6)) 
+  
+}
+```
+
+```{r}
+optimization <- optim(0, f, method = "Brent", lower = 0, upper = 1 )
+```
+
+```{r}
+theta_qr6 <- optimization$par
+theta_qr6
+```
+
+```{r}
+qr6 <- rq(formula = log(claimcst0) ~ agecat  + gender, tau = theta_qr6, data = subset(dataCar, clm == 1))
+```
+
+```{r}
+summary(qr6,  se = "iid") 
+```
+
+
+```{r}
+qr_estimate6 <- exp(predict(qr6, newdata = dataCar))
+```
+
+
+```{r}
+QR_GEN_AGECAT = prob6 * qr_estimate6
+round(unique(QR_GEN_AGECAT),2)
+```
+
+
+```{r}
+dataCar <- cbind(dataCar, QR_GEN_AGECAT) 
+```
+
+# VEH BODY + AREA 
+
+```{r}
+df7 <- aggregate(cbind(exposure, numclaims, claimcst0) ~ veh_body + area, data = dataCar, FUN = sum)
+```
+
+
+```{r}
+logit7 <- glm(clm ~ veh_body + area, family = binomial(link = logitexp(dataCar$exposure)), data = dataCar)
+
+summary(logit7)
+```
+
+
+```{r}
+prob7 = inv.logit(predict(logit7, newdata = dataCar))
+prob_no_claims7 = 1 - prob7
+
+round(unique(prob_no_claims7),3)
+```
+
+
+```{r}
+gamma_glm7 = glm(claimcst0 ~ veh_body + area, family = Gamma(link = "log"), data = subset(dataCar, clm == 1))
+
+summary(gamma_glm7)
+```
+
+```{r}
+cond_mean7 <- predict(gamma_glm7, newdata = dataCar, type = "response")
+
+round(unique(cond_mean7),2)
+```
+
+
+```{r}
+equivalence_premium7 <- (1 - prob_no_claims7) * cond_mean7
+
+round(unique(equivalence_premium7),2)
+```
+
+
+```{r}
+pqr7 = iqr(log(claimcst0) ~ veh_body + area, formula.p = ~ slp(p, k = 1, intercept = FALSE), data = subset(dataCar, clm == 1))
+
+summary(pqr7)
+```
+
+
+```{r}
+theta_star7 <- (theta_bar - prob_no_claims7) / prob7
+
+round(unique(theta_star7),3)
+```
+
+```{r}
+quantile_pqr7 <- array()
+n <- nrow(dataCar)
+for (i in 1:n) {
+  quantile_pqr7[i] <-exp( predict(pqr7, type = "QF", newdata = dataCar[i,], p = theta_star7[i], se = FALSE))
+}
+```
+
+
+```{r}
+quantile_PQR7 <- unlist(quantile_pqr7)
+
+round(unique(quantile_PQR7),2)
+```
+
+
+```{r}
+expected_loss7 <- sum(equivalence_premium7*dataCar$exposure)
+expected_loss7
+aggregate_premium7 <- expected_loss7 * (1 + sigma*3)
+aggregate_premium7
+```
+
+```{r}
+quantile_loss_pqr7 <- sum(quantile_PQR7 * dataCar$exposure)
+quantile_loss_pqr7
+```
+
+```{r}
+alpha_pqr7 <- (aggregate_premium7 - expected_loss7) / (quantile_loss_pqr7 - expected_loss7)
+alpha_pqr7
+```
+
+```{r}
+PQR_BODY_AREA <- alpha_pqr7 * quantile_PQR7 + (1 - alpha_pqr7) * equivalence_premium7
+round(unique(PQR_BODY_AREA),2)
+```
+
+```{r}
+dataCar <- cbind(dataCar, PQR_BODY_AREA)
+```
+
+
+```{r}
+f <- function(theta){
+  qr <- rq(log(claimcst0) ~ veh_body + area, tau = theta, data = subset(dataCar, clm == 1))
+  qr_estimate <- exp(predict(qr, newdata = dataCar))
+  qr_sum <- sum(prob7 * qr_estimate * dataCar$exposure)
+
+return(abs(qr_sum - aggregate_premium7)) 
+  
+}
+```
+
+```{r}
+optimization <- optim(0, f, method = "Brent", lower = 0, upper = 1 )
+```
+
+```{r}
+theta_qr7 <- optimization$par
+theta_qr7
+```
+
+```{r}
+qr7 <- rq(formula = log(claimcst0) ~ veh_body  + area, tau = theta_qr7, data = subset(dataCar, clm == 1))
+```
+
+```{r}
+summary(qr7,  se = "iid") 
+```
+
+
+```{r}
+qr_estimate7 <- exp(predict(qr7, newdata = dataCar))
+```
+
+
+```{r}
+QR_BODY_AREA = prob7 * qr_estimate7
+round(unique(QR_BODY_AREA),2)
+```
+
+
+```{r}
+dataCar <- cbind(dataCar, QR_BODY_AREA) 
+```
+
+# VEH AGE + AGECAT 
+
+```{r}
+df8 <- aggregate(cbind(exposure, numclaims, claimcst0) ~ veh_age + agecat, data = dataCar, FUN = sum)
+```
+
+
+```{r}
+logit8 <- glm(clm ~ veh_age + agecat, family = binomial(link = logitexp(dataCar$exposure)), data = dataCar)
+
+summary(logit8)
+```
+
+
+```{r}
+prob8 = inv.logit(predict(logit8, newdata = dataCar))
+prob_no_claims8 = 1 - prob8
+
+round(unique(prob_no_claims8),3)
+```
+
+
+```{r}
+gamma_glm8 = glm(claimcst0 ~ veh_age + agecat, family = Gamma(link = "log"), data = subset(dataCar, clm == 1))
+
+summary(gamma_glm8)
+```
+
+```{r}
+cond_mean8 <- predict(gamma_glm8, newdata = dataCar, type = "response")
+
+round(unique(cond_mean8),2)
+```
+
+
+```{r}
+equivalence_premium8 <- (1 - prob_no_claims8) * cond_mean8
+
+round(unique(equivalence_premium8),2)
+```
+
+
+```{r}
+pqr8 = iqr(log(claimcst0) ~ veh_age + agecat, formula.p = ~ slp(p, k = 3, intercept = FALSE), data = subset(dataCar, clm == 1))
+
+summary(pqr8)
+```
+
+
+```{r}
+theta_star8 <- (theta_bar - prob_no_claims8) / prob8
+
+round(unique(theta_star8),3)
+```
+
+```{r}
+quantile_pqr8 <- array()
+n <- nrow(dataCar)
+for (i in 1:n) {
+  quantile_pqr8[i] <-exp( predict(pqr8, type = "QF", newdata = dataCar[i,], p = theta_star8[i], se = FALSE))
+}
+```
+
+
+```{r}
+quantile_PQR8 <- unlist(quantile_pqr8)
+
+round(unique(quantile_PQR8),2)
+```
+
+
+```{r}
+expected_loss8 <- sum(equivalence_premium8*dataCar$exposure)
+expected_loss8
+aggregate_premium8 <- expected_loss8 * (1 + sigma*3)
+aggregate_premium8
+```
+
+```{r}
+quantile_loss_pqr8 <- sum(quantile_PQR8 * dataCar$exposure)
+quantile_loss_pqr8
+```
+
+```{r}
+alpha_pqr8 <- (aggregate_premium8 - expected_loss8) / (quantile_loss_pqr8 - expected_loss8)
+alpha_pqr8
+```
+
+```{r}
+PQR_AGE_AGECAT <- alpha_pqr8 * quantile_PQR8 + (1 - alpha_pqr8) * equivalence_premium8
+round(unique(PQR_AGE_AGECAT),2)
+```
+
+```{r}
+dataCar <- cbind(dataCar, PQR_AGE_AGECAT)
+```
+
+
+```{r}
+f <- function(theta){
+  qr <- rq(log(claimcst0) ~ veh_age + agecat, tau = theta, data = subset(dataCar, clm == 1))
+  qr_estimate <- exp(predict(qr, newdata = dataCar))
+  qr_sum <- sum(prob8 * qr_estimate * dataCar$exposure)
+
+return(abs(qr_sum - aggregate_premium8)) 
+  
+}
+```
+
+```{r}
+optimization <- optim(0, f, method = "Brent", lower = 0, upper = 1 )
+```
+
+```{r}
+theta_qr8 <- optimization$par
+theta_qr8
+```
+
+```{r}
+qr8 <- rq(formula = log(claimcst0) ~ veh_age  + agecat, tau = theta_qr8, data = subset(dataCar, clm == 1))
+```
+
+```{r}
+summary(qr8,  se = "iid") 
+```
+
+
+```{r}
+qr_estimate8 <- exp(predict(qr8, newdata = dataCar))
+```
+
+
+```{r}
+QR_AGE_AGECAT = prob8 * qr_estimate8
+round(unique(QR_AGE_AGECAT),2)
+```
+
+
+```{r}
+dataCar <- cbind(dataCar, QR_AGE_AGECAT) 
+```
+
+# GENDER + AREA 
+
+```{r}
+df9 <- aggregate(cbind(exposure, numclaims, claimcst0) ~ gender + area, data = dataCar, FUN = sum)
+```
+
+
+```{r}
+logit9 <- glm(clm ~ gender + area, family = binomial(link = logitexp(dataCar$exposure)), data = dataCar)
+
+summary(logit9)
+```
+
+
+```{r}
+prob9 = inv.logit(predict(logit9, newdata = dataCar))
+prob_no_claims9 = 1 - prob9
+
+round(unique(prob_no_claims9),3)
+```
+
+
+```{r}
+gamma_glm9 = glm(claimcst0 ~ gender + area, family = Gamma(link = "log"), data = subset(dataCar, clm == 1))
+
+summary(gamma_glm9)
+```
+
+```{r}
+cond_mean9 <- predict(gamma_glm9, newdata = dataCar, type = "response")
+
+round(unique(cond_mean9),2)
+```
+
+
+```{r}
+equivalence_premium9 <- (1 - prob_no_claims9) * cond_mean9
+
+round(unique(equivalence_premium9),2)
+```
+
+
+```{r}
+pqr9 = iqr(log(claimcst0) ~ gender + area, formula.p = ~ slp(p, k = 1, intercept = FALSE), data = subset(dataCar, clm == 1))
+
+summary(pqr9)
+```
+
+
+```{r}
+theta_star9 <- (theta_bar - prob_no_claims9) / prob9
+
+round(unique(theta_star9),3)
+```
+
+```{r}
+quantile_pqr9 <- array()
+n <- nrow(dataCar)
+for (i in 1:n) {
+  quantile_pqr9[i] <-exp( predict(pqr9, type = "QF", newdata = dataCar[i,], p = theta_star9[i], se = FALSE))
+}
+```
+
+
+```{r}
+quantile_PQR9 <- unlist(quantile_pqr9)
+
+round(unique(quantile_PQR9),2)
+```
+
+
+```{r}
+expected_loss9 <- sum(equivalence_premium9*dataCar$exposure)
+expected_loss9
+aggregate_premium9 <- expected_loss9 * (1 + sigma*3)
+aggregate_premium9
+```
+
+```{r}
+quantile_loss_pqr9 <- sum(quantile_PQR9 * dataCar$exposure)
+quantile_loss_pqr9
+```
+
+```{r}
+alpha_pqr9 <- (aggregate_premium9 - expected_loss9) / (quantile_loss_pqr9 - expected_loss9)
+alpha_pqr9
+```
+
+```{r}
+PQR_GEN_AREA <- alpha_pqr9 * quantile_PQR9 + (1 - alpha_pqr9) * equivalence_premium9
+round(unique(PQR_GEN_AREA),2)
+```
+
+```{r}
+dataCar <- cbind(dataCar, PQR_GEN_AREA)
+```
+
+
+```{r}
+f <- function(theta){
+  qr <- rq(log(claimcst0) ~ area + gender, tau = theta, data = subset(dataCar, clm == 1))
+  qr_estimate <- exp(predict(qr, newdata = dataCar))
+  qr_sum <- sum(prob9 * qr_estimate * dataCar$exposure)
+
+return(abs(qr_sum - aggregate_premium9)) 
+  
+}
+```
+
+```{r}
+optimization <- optim(0, f, method = "Brent", lower = 0, upper = 1 )
+```
+
+```{r}
+theta_qr9 <- optimization$par
+theta_qr9
+```
+
+```{r}
+qr9 <- rq(formula = log(claimcst0) ~ area + gender, tau = theta_qr9, data = subset(dataCar, clm == 1))
+```
+
+```{r}
+summary(qr9,  se = "iid") 
+```
+
+
+```{r}
+qr_estimate9 <- exp(predict(qr9, newdata = dataCar))
+```
+
+
+```{r}
+QR_GEN_AREA = prob9 * qr_estimate9
+round(unique(QR_GEN_AREA),2)
+```
+
+
+```{r}
+dataCar <- cbind(dataCar, QR_GEN_AREA) 
+```
+
+
+# AREA + AGECAT 
+
+```{r}
+df10 <- aggregate(cbind(exposure, numclaims, claimcst0) ~ area + agecat, data = dataCar, FUN = sum)
+```
+
+
+```{r}
+logit10 <- glm(clm ~ area + agecat, family = binomial(link = logitexp(dataCar$exposure)), data = dataCar)
+
+summary(logit10)
+```
+
+
+```{r}
+prob10 = inv.logit(predict(logit10, newdata = dataCar))
+prob_no_claims10 = 1 - prob10
+
+round(unique(prob_no_claims10),3)
+```
+
+
+```{r}
+gamma_glm10 = glm(claimcst0 ~ area + agecat, family = Gamma(link = "log"), data = subset(dataCar, clm == 1))
+
+summary(gamma_glm10)
+```
+
+```{r}
+cond_mean10 <- predict(gamma_glm10, newdata = dataCar, type = "response")
+
+round(unique(cond_mean10),2)
+```
+
+
+```{r}
+equivalence_premium10 <- (1 - prob_no_claims10) * cond_mean10
+
+round(unique(equivalence_premium10),2)
+```
+
+
+```{r}
+pqr10 = iqr(log(claimcst0) ~ area + agecat, formula.p = ~ slp(p, k = 1, intercept = FALSE), data = subset(dataCar, clm == 1))
+
+summary(pqr10)
+```
+
+
+```{r}
+theta_star10 <- (theta_bar - prob_no_claims10) / prob10
+
+round(unique(theta_star10),3)
+```
+
+```{r}
+quantile_pqr10 <- array()
+n <- nrow(dataCar)
+for (i in 1:n) {
+  quantile_pqr10[i] <-exp( predict(pqr10, type = "QF", newdata = dataCar[i,], p = theta_star10[i], se = FALSE))
+}
+```
+
+
+```{r}
+quantile_PQR10 <- unlist(quantile_pqr10)
+
+round(unique(quantile_PQR10),2)
+```
+
+
+```{r}
+expected_loss10 <- sum(equivalence_premium10*dataCar$exposure)
+expected_loss10
+aggregate_premium10 <- expected_loss10 * (1 + sigma*3)
+aggregate_premium10
+```
+
+```{r}
+quantile_loss_pqr10 <- sum(quantile_PQR10 * dataCar$exposure)
+quantile_loss_pqr10
+```
+
+```{r}
+alpha_pqr10 <- (aggregate_premium10 - expected_loss10) / (quantile_loss_pqr10 - expected_loss10)
+alpha_pqr10
+```
+
+```{r}
+PQR_AREA_AGECAT <- alpha_pqr10 * quantile_PQR10 + (1 - alpha_pqr10) * equivalence_premium10
+round(unique(PQR_AREA_AGECAT),2)
+```
+
+```{r}
+dataCar <- cbind(dataCar, PQR_AREA_AGECAT)
+```
+
+
+```{r}
+f <- function(theta){
+  qr <- rq(log(claimcst0) ~ area + agecat, tau = theta, data = subset(dataCar, clm == 1))
+  qr_estimate <- exp(predict(qr, newdata = dataCar))
+  qr_sum <- sum(prob10 * qr_estimate * dataCar$exposure)
+
+return(abs(qr_sum - aggregate_premium10)) 
+  
+}
+```
+
+```{r}
+optimization <- optim(0, f, method = "Brent", lower = 0, upper = 1 )
+```
+
+```{r}
+theta_qr10 <- optimization$par
+theta_qr10
+```
+
+```{r}
+qr10 <- rq(formula = log(claimcst0) ~ area  + agecat, tau = theta_qr10, data = subset(dataCar, clm == 1))
+```
+
+```{r}
+summary(qr10,  se = "iid") 
+```
+
+
+```{r}
+qr_estimate10 <- exp(predict(qr10, newdata = dataCar))
+```
+
+
+```{r}
+QR_AREA_AGECAT = prob10 * qr_estimate10
+round(unique(QR_AREA_AGECAT),2)
+```
+
+
+```{r}
+dataCar <- cbind(dataCar, QR_AREA_AGECAT) 
+```
+
+# VEH AGE + VEH VALUE DISCR 
+
+```{r}
+df11 <- aggregate(cbind(exposure, numclaims, claimcst0) ~ veh_age + veh_value_discr, data = dataCar, FUN = sum)
+```
+
+
+```{r}
+logit11 <- glm(clm ~ veh_age + veh_value_discr, family = binomial(link = logitexp(dataCar$exposure)), data = dataCar)
+
+summary(logit11)
+```
+
+
+```{r}
+prob11 = inv.logit(predict(logit11, newdata = dataCar))
+prob_no_claims11 = 1 - prob11
+
+round(unique(prob_no_claims11),3)
+```
+
+
+```{r}
+gamma_glm11 = glm(claimcst0 ~ veh_age + veh_value_discr, family = Gamma(link = "log"), data = subset(dataCar, clm == 1))
+
+summary(gamma_glm11)
+```
+
+```{r}
+cond_mean11 <- predict(gamma_glm11, newdata = dataCar, type = "response")
+
+round(unique(cond_mean11),2)
+```
+
+
+```{r}
+equivalence_premium11 <- (1 - prob_no_claims11) * cond_mean11
+
+round(unique(equivalence_premium11),2)
+```
+
+
+```{r}
+pqr11 = iqr(log(claimcst0) ~ veh_age + veh_value_discr, formula.p = ~ slp(p, k = 3, intercept = FALSE), data = subset(dataCar, clm == 1))
+
+summary(pqr11)
+```
+
+
+```{r}
+theta_star11 <- (theta_bar - prob_no_claims11) / prob11
+
+round(unique(theta_star11),3)
+```
+
+```{r}
+quantile_pqr11 <- array()
+n <- nrow(dataCar)
+for (i in 1:n) {
+  quantile_pqr11[i] <-exp( predict(pqr11, type = "QF", newdata = dataCar[i,], p = theta_star11[i], se = FALSE))
+}
+```
+
+
+```{r}
+quantile_PQR11 <- unlist(quantile_pqr11)
+
+round(unique(quantile_PQR11),2)
+```
+
+
+```{r}
+expected_loss11 <- sum(equivalence_premium11*dataCar$exposure)
+expected_loss11
+aggregate_premium11 <- expected_loss11 * (1 + sigma*3)
+aggregate_premium11
+```
+
+```{r}
+quantile_loss_pqr11 <- sum(quantile_PQR11 * dataCar$exposure)
+quantile_loss_pqr11
+```
+
+```{r}
+alpha_pqr11 <- (aggregate_premium11 - expected_loss11) / (quantile_loss_pqr11 - expected_loss11)
+alpha_pqr11
+```
+
+```{r}
+PQR_AGE_VALUE <- alpha_pqr11 * quantile_PQR11 + (1 - alpha_pqr11) * equivalence_premium11
+round(unique(PQR_AGE_VALUE),2)
+```
+
+```{r}
+dataCar <- cbind(dataCar, PQR_AGE_VALUE)
+```
+
+
+```{r}
+f <- function(theta){
+  qr <- rq(log(claimcst0) ~ veh_age + veh_value_discr, tau = theta, data = subset(dataCar, clm == 1))
+  qr_estimate <- exp(predict(qr, newdata = dataCar))
+  qr_sum <- sum(prob11 * qr_estimate * dataCar$exposure)
+
+return(abs(qr_sum - aggregate_premium11)) 
+  
+}
+```
+
+```{r}
+optimization <- optim(0, f, method = "Brent", lower = 0, upper = 1 )
+```
+
+```{r}
+theta_qr11 <- optimization$par
+theta_qr11
+```
+
+```{r}
+qr11 <- rq(formula = log(claimcst0) ~ veh_age  + veh_value_discr, tau = theta_qr11, data = subset(dataCar, clm == 1))
+```
+
+```{r}
+summary(qr11,  se = "iid") 
+```
+
+
+```{r}
+qr_estimate11 <- exp(predict(qr11, newdata = dataCar))
+```
+
+
+```{r}
+QR_AGE_VALUE = prob11 * qr_estimate11
+round(unique(QR_AGE_VALUE),2)
+```
+
+
+```{r}
+dataCar <- cbind(dataCar, QR_AGE_VALUE) 
+```
+
+# GENDER + VEH VALUE DISCR 
+
+```{r}
+df12 <- aggregate(cbind(exposure, numclaims, claimcst0) ~ gender + veh_value_discr, data = dataCar, FUN = sum)
+```
+
+
+```{r}
+logit12 <- glm(clm ~ gender + veh_value_discr, family = binomial(link = logitexp(dataCar$exposure)), data = dataCar)
+
+summary(logit12)
+```
+
+
+```{r}
+prob12 = inv.logit(predict(logit12, newdata = dataCar))
+prob_no_claims12 = 1 - prob12
+
+round(unique(prob_no_claims12),3)
+```
+
+
+```{r}
+gamma_glm12 = glm(claimcst0 ~ gender + veh_value_discr, family = Gamma(link = "log"), data = subset(dataCar, clm == 1))
+
+summary(gamma_glm12)
+```
+
+```{r}
+cond_mean12 <- predict(gamma_glm12, newdata = dataCar, type = "response")
+
+round(unique(cond_mean12),2)
+```
+
+
+```{r}
+equivalence_premium12 <- (1 - prob_no_claims12) * cond_mean12
+
+round(unique(equivalence_premium12),2)
+```
+
+
+```{r}
+pqr12 = iqr(log(claimcst0) ~ gender + veh_value_discr, formula.p = ~ slp(p, k = 3, intercept = FALSE), data = subset(dataCar, clm == 1))
+
+summary(pqr12)
+```
+
+
+```{r}
+theta_star12 <- (theta_bar - prob_no_claims12) / prob12
+
+round(unique(theta_star12),3)
+```
+
+```{r}
+quantile_pqr12 <- array()
+n <- nrow(dataCar)
+for (i in 1:n) {
+  quantile_pqr12[i] <-exp( predict(pqr12, type = "QF", newdata = dataCar[i,], p = theta_star12[i], se = FALSE))
+}
+```
+
+
+```{r}
+quantile_PQR12 <- unlist(quantile_pqr12)
+
+round(unique(quantile_PQR12),2)
+```
+
+
+```{r}
+expected_loss12 <- sum(equivalence_premium12*dataCar$exposure)
+expected_loss12
+aggregate_premium12 <- expected_loss12 * (1 + sigma*3)
+aggregate_premium12
+```
+
+```{r}
+quantile_loss_pqr12 <- sum(quantile_PQR12 * dataCar$exposure)
+quantile_loss_pqr12
+```
+
+```{r}
+alpha_pqr12 <- (aggregate_premium12 - expected_loss12) / (quantile_loss_pqr12 - expected_loss12)
+alpha_pqr12
+```
+
+```{r}
+PQR_GEN_VALUE <- alpha_pqr12 * quantile_PQR12 + (1 - alpha_pqr12) * equivalence_premium12
+round(unique(PQR_GEN_VALUE),2)
+```
+
+```{r}
+dataCar <- cbind(dataCar, PQR_GEN_VALUE)
+```
+
+
+```{r}
+f <- function(theta){
+  qr <- rq(log(claimcst0) ~ veh_value_discr + gender, tau = theta, data = subset(dataCar, clm == 1))
+  qr_estimate <- exp(predict(qr, newdata = dataCar))
+  qr_sum <- sum(prob12 * qr_estimate * dataCar$exposure)
+
+return(abs(qr_sum - aggregate_premium12)) 
+  
+}
+```
+
+```{r}
+optimization <- optim(0, f, method = "Brent", lower = 0, upper = 1 )
+```
+
+```{r}
+theta_qr12 <- optimization$par
+theta_qr12
+```
+
+```{r}
+qr12 <- rq(formula = log(claimcst0) ~ veh_value_discr  + gender, tau = theta_qr12, data = subset(dataCar, clm == 1))
+```
+
+```{r}
+summary(qr12,  se = "iid") 
+```
+
+
+```{r}
+qr_estimate12 <- exp(predict(qr12, newdata = dataCar))
+```
+
+
+```{r}
+QR_GEN_VALUE = prob12 * qr_estimate12
+round(unique(QR_GEN_VALUE),2)
+```
+
+
+```{r}
+dataCar <- cbind(dataCar, QR_GEN_VALUE) 
+```
+
+# VEH BODY + VEH VALUE DISCR 
+
+```{r}
+df13 <- aggregate(cbind(exposure, numclaims, claimcst0) ~ veh_body + veh_value_discr, data = dataCar, FUN = sum)
+```
+
+
+```{r}
+logit13 <- glm(clm ~ veh_body + veh_value_discr, family = binomial(link = logitexp(dataCar$exposure)), data = dataCar)
+
+summary(logit13)
+```
+
+
+```{r}
+prob13 = inv.logit(predict(logit13, newdata = dataCar))
+prob_no_claims13 = 1 - prob13
+
+round(unique(prob_no_claims13),3)
+```
+
+
+```{r}
+gamma_glm13 = glm(claimcst0 ~ veh_body + veh_value_discr, family = Gamma(link = "log"), data = subset(dataCar, clm == 1))
+
+summary(gamma_glm13)
+```
+
+```{r}
+cond_mean13 <- predict(gamma_glm13, newdata = dataCar, type = "response")
+
+round(unique(cond_mean13),2)
+```
+
+
+```{r}
+equivalence_premium13 <- (1 - prob_no_claims13) * cond_mean13
+
+round(unique(equivalence_premium13),2)
+```
+
+
+```{r}
+pqr13 = iqr(log(claimcst0) ~ veh_body + veh_value_discr, formula.p = ~ slp(p, k = 1, intercept = FALSE), data = subset(dataCar, clm == 1))
+
+summary(pqr13)
+```
+
+
+```{r}
+theta_star13 <- (theta_bar - prob_no_claims13) / prob13
+
+round(unique(theta_star13),3)
+```
+
+```{r}
+quantile_pqr13 <- array()
+n <- nrow(dataCar)
+for (i in 1:n) {
+  quantile_pqr13[i] <-exp( predict(pqr13, type = "QF", newdata = dataCar[i,], p = theta_star13[i], se = FALSE))
+}
+```
+
+
+```{r}
+quantile_PQR13 <- unlist(quantile_pqr13)
+
+round(unique(quantile_PQR13),2)
+```
+
+
+```{r}
+expected_loss13 <- sum(equivalence_premium13*dataCar$exposure)
+expected_loss13
+aggregate_premium13 <- expected_loss13 * (1 + sigma*3)
+aggregate_premium13
+```
+
+```{r}
+quantile_loss_pqr13 <- sum(quantile_PQR13 * dataCar$exposure)
+quantile_loss_pqr13
+```
+
+```{r}
+alpha_pqr13 <- (aggregate_premium13 - expected_loss13) / (quantile_loss_pqr13 - expected_loss13)
+alpha_pqr13
+```
+
+```{r}
+PQR_BODY_VALUE <- alpha_pqr13 * quantile_PQR13 + (1 - alpha_pqr13) * equivalence_premium13
+round(unique(PQR_BODY_VALUE),2)
+```
+
+```{r}
+dataCar <- cbind(dataCar, PQR_BODY_VALUE)
+```
+
+
+```{r}
+f <- function(theta){
+  qr <- rq(log(claimcst0) ~ veh_body + veh_value_discr, tau = theta, data = subset(dataCar, clm == 1))
+  qr_estimate <- exp(predict(qr, newdata = dataCar))
+  qr_sum <- sum(prob13 * qr_estimate * dataCar$exposure)
+
+return(abs(qr_sum - aggregate_premium13)) 
+  
+}
+```
+
+```{r}
+optimization <- optim(0, f, method = "Brent", lower = 0, upper = 1 )
+```
+
+```{r}
+theta_qr13 <- optimization$par
+theta_qr13
+```
+
+```{r}
+qr13 <- rq(formula = log(claimcst0) ~ veh_body  + veh_value_discr, tau = theta_qr13, data = subset(dataCar, clm == 1))
+```
+
+```{r}
+summary(qr13,  se = "iid") 
+```
+
+
+```{r}
+qr_estimate13 <- exp(predict(qr13, newdata = dataCar))
+```
+
+
+```{r}
+QR_BODY_VALUE = prob13 * qr_estimate13
+round(unique(QR_BODY_VALUE),2)
+```
+
+
+```{r}
+dataCar <- cbind(dataCar, QR_BODY_VALUE) 
+```
+
+# VEH VALUE DISCR + AGECAT 
+
+```{r}
+df14 <- aggregate(cbind(exposure, numclaims, claimcst0) ~ veh_value_discr + agecat, data = dataCar, FUN = sum)
+```
+
+
+```{r}
+logit14 <- glm(clm ~ veh_value_discr + agecat, family = binomial(link = logitexp(dataCar$exposure)), data = dataCar)
+
+summary(logit14)
+```
+
+
+```{r}
+prob14 = inv.logit(predict(logit14, newdata = dataCar))
+prob_no_claims14 = 1 - prob14
+
+round(unique(prob_no_claims14),3)
+```
+
+
+```{r}
+gamma_glm14 = glm(claimcst0 ~ veh_value_discr + agecat, family = Gamma(link = "log"), data = subset(dataCar, clm == 1))
+
+summary(gamma_glm14)
+```
+
+```{r}
+cond_mean14 <- predict(gamma_glm14, newdata = dataCar, type = "response")
+
+round(unique(cond_mean14),2)
+```
+
+
+```{r}
+equivalence_premium14 <- (1 - prob_no_claims14) * cond_mean14
+
+round(unique(equivalence_premium14),2)
+```
+
+
+```{r}
+pqr14 = iqr(log(claimcst0) ~ veh_value_discr + agecat, formula.p = ~ slp(p, k = 3, intercept = FALSE), data = subset(dataCar, clm == 1))
+
+summary(pqr14)
+```
+
+
+```{r}
+theta_star14 <- (theta_bar - prob_no_claims14) / prob14
+
+round(unique(theta_star14),3)
+```
+
+```{r}
+quantile_pqr14 <- array()
+n <- nrow(dataCar)
+for (i in 1:n) {
+  quantile_pqr14[i] <-exp( predict(pqr14, type = "QF", newdata = dataCar[i,], p = theta_star14[i], se = FALSE))
+}
+```
+
+
+```{r}
+quantile_PQR14 <- unlist(quantile_pqr14)
+
+round(unique(quantile_PQR14),2)
+```
+
+
+```{r}
+expected_loss14 <- sum(equivalence_premium14*dataCar$exposure)
+expected_loss14
+aggregate_premium14 <- expected_loss14 * (1 + sigma*3)
+aggregate_premium14
+```
+
+```{r}
+quantile_loss_pqr14 <- sum(quantile_PQR14 * dataCar$exposure)
+quantile_loss_pqr14
+```
+
+```{r}
+alpha_pqr14 <- (aggregate_premium14 - expected_loss14) / (quantile_loss_pqr14 - expected_loss14)
+alpha_pqr14
+```
+
+```{r}
+PQR_VALUE_AGECAT <- alpha_pqr14 * quantile_PQR14 + (1 - alpha_pqr14) * equivalence_premium14
+round(unique(PQR_VALUE_AGECAT),2)
+```
+
+```{r}
+dataCar <- cbind(dataCar, PQR_VALUE_AGECAT)
+```
+
+
+```{r}
+f <- function(theta){
+  qr <- rq(log(claimcst0) ~ veh_value_discr + agecat, tau = theta, data = subset(dataCar, clm == 1))
+  qr_estimate <- exp(predict(qr, newdata = dataCar))
+  qr_sum <- sum(prob14 * qr_estimate * dataCar$exposure)
+
+return(abs(qr_sum - aggregate_premium14)) 
+  
+}
+```
+
+```{r}
+optimization <- optim(0, f, method = "Brent", lower = 0, upper = 1 )
+```
+
+```{r}
+theta_qr14 <- optimization$par
+theta_qr14
+```
+
+```{r}
+qr14 <- rq(formula = log(claimcst0) ~ veh_value_discr  + agecat, tau = theta_qr14, data = subset(dataCar, clm == 1))
+```
+
+```{r}
+summary(qr14,  se = "iid") 
+```
+
+
+```{r}
+qr_estimate14 <- exp(predict(qr14, newdata = dataCar))
+```
+
+
+```{r}
+QR_VALUE_AGECAT = prob14 * qr_estimate14
+round(unique(QR_VALUE_AGECAT),2)
+```
+
+
+```{r}
+dataCar <- cbind(dataCar, QR_VALUE_AGECAT) 
+```
+
+
+# AREA + VEH VALUE DISCR 
+
+```{r}
+df15 <- aggregate(cbind(exposure, numclaims, claimcst0) ~ area + veh_value_discr, data = dataCar, FUN = sum)
+```
+
+
+```{r}
+logit15 <- glm(clm ~ area + veh_value_discr, family = binomial(link = logitexp(dataCar$exposure)), data = dataCar)
+
+summary(logit15)
+```
+
+
+```{r}
+prob15 = inv.logit(predict(logit15, newdata = dataCar))
+prob_no_claims15 = 1 - prob15
+
+round(unique(prob_no_claims15),3)
+```
+
+
+```{r}
+gamma_glm15 = glm(claimcst0 ~ veh_value_discr + area, family = Gamma(link = "log"), data = subset(dataCar, clm == 1))
+
+summary(gamma_glm15)
+```
+
+```{r}
+cond_mean15 <- predict(gamma_glm15, newdata = dataCar, type = "response")
+
+round(unique(cond_mean15),2)
+```
+
+
+```{r}
+equivalence_premium15 <- (1 - prob_no_claims15) * cond_mean15
+
+round(unique(equivalence_premium15),2)
+```
+
+
+```{r}
+pqr15 = iqr(log(claimcst0) ~ veh_value_discr + area, formula.p = ~ slp(p, k = 1, intercept = FALSE), data = subset(dataCar, clm == 1))
+
+summary(pqr15)
+```
+
+
+```{r}
+theta_star15 <- (theta_bar - prob_no_claims15) / prob15
+
+round(unique(theta_star15),3)
+```
+
+```{r}
+quantile_pqr15 <- array()
+n <- nrow(dataCar)
+for (i in 1:n) {
+  quantile_pqr15[i] <-exp( predict(pqr15, type = "QF", newdata = dataCar[i,], p = theta_star15[i], se = FALSE))
+}
+```
+
+
+```{r}
+quantile_PQR15 <- unlist(quantile_pqr15)
+
+round(unique(quantile_PQR15),2)
+```
+
+
+```{r}
+expected_loss15 <- sum(equivalence_premium15*dataCar$exposure)
+expected_loss15
+aggregate_premium15 <- expected_loss15 * (1 + sigma*3)
+aggregate_premium15
+```
+
+```{r}
+quantile_loss_pqr15 <- sum(quantile_PQR15 * dataCar$exposure)
+quantile_loss_pqr15
+```
+
+```{r}
+alpha_pqr15 <- (aggregate_premium15 - expected_loss15) / (quantile_loss_pqr15 - expected_loss15)
+alpha_pqr15
+```
+
+```{r}
+PQR_VALUE_AREA <- alpha_pqr15 * quantile_PQR15 + (1 - alpha_pqr15) * equivalence_premium15
+round(unique(PQR_VALUE_AREA),2)
+```
+
+```{r}
+dataCar <- cbind(dataCar, PQR_VALUE_AREA)
+```
+
+
+```{r}
+f <- function(theta){
+  qr <- rq(log(claimcst0) ~ veh_value_discr + area, tau = theta, data = subset(dataCar, clm == 1))
+  qr_estimate <- exp(predict(qr, newdata = dataCar))
+  qr_sum <- sum(prob15 * qr_estimate * dataCar$exposure)
+
+return(abs(qr_sum - aggregate_premium15)) 
+  
+}
+```
+
+```{r}
+optimization <- optim(0, f, method = "Brent", lower = 0, upper = 1 )
+```
+
+```{r}
+theta_qr15 <- optimization$par
+theta_qr15
+```
+
+```{r}
+qr15 <- rq(formula = log(claimcst0) ~ veh_value_discr + area, tau = theta_qr15, data = subset(dataCar, clm == 1))
+```
+
+```{r}
+summary(qr15,  se = "iid") 
+```
+
+
+```{r}
+qr_estimate15 <- exp(predict(qr15, newdata = dataCar))
+```
+
+
+```{r}
+QR_VALUE_AREA = prob15 * qr_estimate15
+round(unique(QR_VALUE_AREA),2)
+```
+
+
+```{r}
+dataCar <- cbind(dataCar, QR_VALUE_AREA) 
+```
+
+I calculate the mean squared distance for each pair.
+The distance is given by the difference between the premium calculated with the full model and the premium calculated with each two-covariate model.
+
+AGE + GENDER
+```{r}
+distance1 <- array()
+for (i in 1:n){
+  distance1[i] = (dataCar[i,13] - dataCar[i,15])^2
+  mean_distance1 = mean(distance1)
+}
+mean_distance1
+```
+```{r}
+distance1_QR <- array()
+for (i in 1:n){
+  distance1_QR[i] = (dataCar[i,14] - dataCar[i,16])^2
+  mean_distance1_QR = mean(distance1_QR)
+}
+mean_distance1_QR
+```
+
+BODY + AGE
+```{r}
+distance2 <- array()
+for (i in 1:n){
+  distance2[i] = (dataCar[i,13] - dataCar[i,17])^2
+  mean_distance2 = mean(distance2)
+}
+mean_distance2
+```
+```{r}
+distance2_QR <- array()
+for (i in 1:n){
+  distance2_QR[i] = (dataCar[i,14] - dataCar[i,18])^2
+  mean_distance2_QR = mean(distance2_QR)
+}
+mean_distance2_QR
+```
+
+BODY + AGECAT
+```{r}
+distance3 <- array()
+for (i in 1:n){
+  distance3[i] = (dataCar[i,13] - dataCar[i,19])^2
+  mean_distance3 = mean(distance3)
+}
+mean_distance3
+```
+```{r}
+distance3_QR <- array()
+for (i in 1:n){
+  distance3_QR[i] = (dataCar[i,14] - dataCar[i,20])^2
+  mean_distance3_QR = mean(distance3_QR)
+}
+mean_distance3_QR
+```
+
+BODY + GENDER
+```{r}
+distance4 <- array()
+for (i in 1:n){
+  distance4[i] = (dataCar[i,13] - dataCar[i,21])^2
+  mean_distance4 = mean(distance4)
+}
+mean_distance4
+```
+```{r}
+distance4_QR <- array()
+for (i in 1:n){
+  distance4_QR[i] = (dataCar[i,14] - dataCar[i,22])^2
+  mean_distance4_QR = mean(distance4_QR)
+}
+mean_distance4_QR
+```
+
+AGE + AREA
+```{r}
+distance5 <- array()
+for (i in 1:n){
+  distance5[i] = (dataCar[i,13] - dataCar[i,23])^2
+  mean_distance5 = mean(distance5)
+}
+mean_distance5
+```
+```{r}
+distance5_QR <- array()
+for (i in 1:n){
+  distance5_QR[i] = (dataCar[i,14] - dataCar[i,24])^2
+  mean_distance5_QR = mean(distance5_QR)
+}
+mean_distance5_QR
+```
+
+
+GENDER + AGECAT
+```{r}
+distance6 <- array()
+for (i in 1:n){
+  distance6[i] = (dataCar[i,13] - dataCar[i,25])^2
+  mean_distance6 = mean(distance6)
+}
+mean_distance6
+```
+```{r}
+distance6_QR <- array()
+for (i in 1:n){
+  distance6_QR[i] = (dataCar[i,14] - dataCar[i,26])^2
+  mean_distance6_QR = mean(distance6_QR)
+}
+mean_distance6_QR
+```
+
+BODY + AREA
+```{r}
+distance7 <- array()
+for (i in 1:n){
+  distance7[i] = (dataCar[i,13] - dataCar[i,27])^2
+  mean_distance7 = mean(distance7)
+}
+mean_distance7
+```
+```{r}
+distance7_QR <- array()
+for (i in 1:n){
+  distance7_QR[i] = (dataCar[i,14] - dataCar[i,28])^2
+  mean_distance7_QR = mean(distance7_QR)
+}
+mean_distance7_QR
+```
+
+AGE + AGECAT
+```{r}
+distance8 <- array()
+for (i in 1:n){
+  distance8[i] = (dataCar[i,13] - dataCar[i,29])^2
+  mean_distance8 = mean(distance8)
+}
+mean_distance8
+```
+```{r}
+distance8_QR <- array()
+for (i in 1:n){
+  distance8_QR[i] = (dataCar[i,14] - dataCar[i,30])^2
+  mean_distance8_QR = mean(distance8_QR)
+}
+mean_distance8_QR
+```
+
+GENDER + AREA
+```{r}
+distance9 <- array()
+for (i in 1:n){
+  distance9[i] = (dataCar[i,13] - dataCar[i,31])^2
+  mean_distance9 = mean(distance9)
+}
+mean_distance9
+```
+```{r}
+distance9_QR <- array()
+for (i in 1:n){
+  distance9_QR[i] = (dataCar[i,14] - dataCar[i,32])^2
+  mean_distance9_QR = mean(distance9_QR)
+}
+mean_distance9_QR
+```
+
+
+AREA + AGECAT
+```{r}
+distance10 <- array()
+for (i in 1:n){
+  distance10[i] = (dataCar[i,13] - dataCar[i,33])^2
+  mean_distance10 = mean(distance10)
+}
+mean_distance10
+```
+```{r}
+distance10_QR <- array()
+for (i in 1:n){
+  distance10_QR[i] = (dataCar[i,14] - dataCar[i,34])^2
+  mean_distance10_QR = mean(distance10_QR)
+}
+mean_distance10_QR
+```
+
+AGE + VALUE 
+```{r}
+distance11 <- array()
+for (i in 1:n){
+  distance11[i] = (dataCar[i,13] - dataCar[i,35])^2
+  mean_distance11 = mean(distance11)
+}
+mean_distance11
+```
+```{r}
+distance11_QR <- array()
+for (i in 1:n){
+  distance11_QR[i] = (dataCar[i,14] - dataCar[i,36])^2
+  mean_distance11_QR = mean(distance11_QR)
+}
+mean_distance11_QR
+```
+
+GENDER + VALUE
+```{r}
+distance12 <- array()
+for (i in 1:n){
+  distance12[i] = (dataCar[i,13] - dataCar[i,37])^2
+  mean_distance12 = mean(distance12)
+}
+mean_distance12
+```
+```{r}
+distance12_QR <- array()
+for (i in 1:n){
+  distance12_QR[i] = (dataCar[i,14] - dataCar[i,38])^2
+  mean_distance12_QR = mean(distance12_QR)
+}
+mean_distance12_QR
+```
+
+BODY + VALUE
+```{r}
+distance13 <- array()
+for (i in 1:n){
+  distance13[i] = (dataCar[i,13] - dataCar[i,39])^2
+  mean_distance13 = mean(distance13)
+}
+mean_distance13
+```
+```{r}
+distance13_QR <- array()
+for (i in 1:n){
+  distance13_QR[i] = (dataCar[i,14] - dataCar[i,40])^2
+  mean_distance13_QR = mean(distance13_QR)
+}
+mean_distance13_QR
+```
+
+AGECAT + VALUE
+```{r}
+distance14 <- array()
+for (i in 1:n){
+  distance14[i] = (dataCar[i,13] - dataCar[i,41])^2
+  mean_distance14 = mean(distance14)
+}
+mean_distance14
+```
+
+```{r}
+distance14_QR <- array()
+for (i in 1:n){
+  distance14_QR[i] = (dataCar[i,14] - dataCar[i,42])^2
+  mean_distance14_QR = mean(distance14_QR)
+}
+mean_distance14_QR
+```
+
+AREA + VALUE
+```{r}
+distance15 <- array()
+for (i in 1:n){
+  distance15[i] = (dataCar[i,13] - dataCar[i,43])^2
+  mean_distance15 = mean(distance15)
+}
+mean_distance15
+```
+
+```{r}
+distance15_QR <- array()
+for (i in 1:n){
+  distance15_QR[i] = (dataCar[i,14] - dataCar[i,44])^2
+  mean_distance15_QR = mean(distance15_QR)
+}
+mean_distance15_QR
+```
+
+```{r}
+rating_system <- c("veh_age - gender", "veh_body - veh_age", "veh_body - gender", "veh_body - agecat", "veh_age - area", "gender - agecat", "veh_body - area", "veh_age - agecat", "gender - area", "area - agecat", "veh_age - veh_value_discr", "gender - veh_value_discr","veh_body - veh_value_discr", "agecat - veh_value_discr", "area - veh_value_discr")
+```
+
+```{r}
+mean_distance_PQR <- c(mean_distance1, mean_distance2, mean_distance4, mean_distance3, mean_distance5, mean_distance6, mean_distance7, mean_distance8, mean_distance9, mean_distance10, mean_distance11, mean_distance12, mean_distance13, mean_distance14, mean_distance15)
+```
+
+```{r}
+mean_distance_QR <- c(mean_distance1_QR, mean_distance2_QR, mean_distance4_QR, mean_distance3_QR, mean_distance5_QR, mean_distance6_QR, mean_distance7_QR, mean_distance8_QR, mean_distance9_QR, mean_distance10_QR, mean_distance11_QR, mean_distance12_QR, mean_distance13_QR, mean_distance14_QR, mean_distance15_QR)
+```
+
+```{r}
+m_distances <- data.frame(Rating_system = rating_system, Mean_distance_PQR = mean_distance_PQR, Mean_distance_QR = mean_distance_QR)
+```
+
+```{r}
+write.csv2(dataCar, "Quantile_Premium_Principle_completo.csv")
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
